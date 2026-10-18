@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101827">
+<title>RIVON SpO₂ | Bluefy</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:dark}
+*{box-sizing:border-box}
+body{background:#0b1220;color:#edf3fc;margin:0;min-height:100vh}
+main{max-width:550px;margin:auto;padding:30px 18px 50px}
+h1{font-size:29px;letter-spacing:-.8px;margin:0 0 8px}
+small,p.muted{color:#a6b9d0}
+p.muted{font-size:14px;line-height:1.5}
+.card{border:1px solid #2a3c54;background:#182338;padding:22px;border-radius:19px;margin:18px 0}
+.caption{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:#a5b8cd;font-weight:700}
+.value{font-weight:750;font-size:85px;letter-spacing:-4px;margin:12px 0;line-height:1.2;font-variant-numeric:tabular-nums}
+.value small{font-size:30px;letter-spacing:0}
+.value.good{color:#73ddb8}
+.status{font-size:14px;color:#c2cde0;margin:0 0 13px}
+button{font:inherit;font-weight:650;border:0;border-radius:12px;padding:14px 12px;min-height:48px;width:100%;cursor:pointer}
+button:disabled{opacity:.35;cursor:default}
+.primary{background:#63d9b4;color:#09211a}.secondary{background:#344763;color:#f0f5ff}.stop{background:#5b3641;color:#ffcad2}
+.buttons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+details{background:#142033;border:1px solid #29384d;border-radius:14px;padding:16px}
+summary{cursor:pointer;font-size:14px;font-weight:650}
+pre{font-size:12px;color:#b9cde5;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;max-height:290px;overflow:auto}
+footer{font-size:12px;color:#879bb5;line-height:1.5;margin-top:20px}
+</style>
+</head>
+<body>
+<main>
+<h1>RIVON <span style="color:#73ddb8">SpO₂</span></h1>
+<p class="muted">iPhone için kişisel BLE ölçüm ekranı. Bluefy üzerinden çalışır.</p>
+<section class="card">
+<div class="caption">Oksijen satürasyonu</div>
+<div class="value" id="oxygen">--<small>%</small></div>
+<div id="status" class="status" role="status">Bağlı değil</div>
+<div id="timestamp" class="muted" style="font-size:12px">Henüz ölçüm yok</div>
+</section>
+<section class="card">
+<div class="caption">RIVON bilekliği</div>
+<p id="device" class="muted">Bağlı değil</p>
+<button id="connect" class="primary">RIVON'a bağlan</button>
+<div class="buttons">
+<button id="start" class="secondary" disabled>SpO₂ ölç</button>
+<button id="stop" class="stop" disabled>Durdur</button>
+</div>
+<button id="disconnect" class="secondary" disabled style="margin-top:10px">Bağlantıyı kes</button>
+</section>
+<p class="muted">Bilekliği takılı tutup bu sayfayı ön planda açık bırak. Ölçüm 50 saniye veya daha uzun sürebilir. İlk geçerli sonuçta otomatik durur; 120 saniye içinde sonuç gelmezse durdurmayı dener.</p>
+<details><summary>Bluetooth kayıtları (hata ayıklama)</summary><pre id="log">Hazır.</pre></details>
+<footer>Deneysel kişisel uygulama. Tıbbi tanı veya tedavi kararları için valide edilmemiştir. Ölçümler herhangi bir sunucuya gönderilmez.</footer>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const SERVICE = 0xFDDA, WRITE = 0xFDD2, NOTIFY1 = 0xFDD1, NOTIFY3 = 0xFDD3;
+const ON  = Uint8Array.of(0xFD,0xDA,0x10,0x07,0x01,0x0B,0x01);
+const OFF = Uint8Array.of(0xFD,0xDA,0x10,0x07,0x01,0x0B,0x00);
+let device=null, writer=null, measuring=false, busy=false, timer=null, stopping=false;
+const hex = b => Array.from(b,v=>v.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+function log(text){
+ const t=new Date().toLocaleTimeString('tr-TR',{hour12:false});
+ const el=$('log'); el.textContent=(el.textContent==='Hazır.'?'':el.textContent+'\n')+`[${t}] ${text}`;
+ const rows=el.textContent.split('\n'); if(rows.length>100)el.textContent=rows.slice(-100).join('\n');
+ el.scrollTop=el.scrollHeight;
+}
+function status(text){$('status').textContent=text;}
+function refresh(){
+ const online=!!(device&&device.gatt&&device.gatt.connected&&writer);
+ $('connect').disabled=online||busy;
+ $('start').disabled=!online||measuring||stopping;
+ $('stop').disabled=!online||!measuring||stopping;
+ $('disconnect').disabled=!online||stopping;
+ $('device').textContent=online?`${device.name||'RIVON'}: bağlı`:'Bağlı değil';
+}
+function disconnected(){clearTimeout(timer);timer=null;writer=null;measuring=false;stopping=false;status('Bağlantı kesildi');log('BLE bağlantısı kesildi.');refresh();}
+async function subscribe(service,id,required){
+ try{
+  const c=await service.getCharacteristic(id);
+  c.addEventListener('characteristicvaluechanged',receive);
+  await c.startNotifications(); log(`0x${id.toString(16).toUpperCase()} bildirimleri etkin.`);
+ }catch(e){log(`Bildirim hatası 0x${id.toString(16)}: ${e.message}`);if(required)throw e;}
+}
+async function connect(){
+ if(busy)return;
+ if(!navigator.bluetooth){status('Web Bluetooth yok. Bluefy ve HTTPS kullan.');log('navigator.bluetooth bulunamadı.');return;}
+ busy=true;refresh();status('Cihaz seçimi bekleniyor');
+ try{
+  device=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'RIVON'}],optionalServices:[SERVICE]});
+  device.addEventListener('gattserverdisconnected',disconnected);
+  const server=await device.gatt.connect();
+  const service=await server.getPrimaryService(SERVICE);
+  writer=await service.getCharacteristic(WRITE);
+  await subscribe(service,NOTIFY3,true); // RIVON SpO2 sonucunu FDD3 üzerinden gönderdi.
+  await subscribe(service,NOTIFY1,false);
+  status('Bağlandı, ölçüme hazır');log('RIVON BLE bağlantısı hazır.');
+ }catch(e){status('Bağlantı başarısız');log(`Bağlantı hatası: ${e.name}: ${e.message}`);
+  if(device&&device.gatt&&device.gatt.connected)device.gatt.disconnect();writer=null;
+ }finally{busy=false;refresh();}
+}
+async function write(bytes){
+ if(!writer||!device||!device.gatt.connected)throw new Error('RIVON bağlı değil');
+ if(typeof writer.writeValueWithoutResponse==='function')await writer.writeValueWithoutResponse(bytes);
+ else if(typeof writer.writeValue==='function')await writer.writeValue(bytes);
+ else throw new Error('BLE yazma API desteklenmiyor');
+ log('TX FDD2: '+hex(bytes));
+}
+async function start(){
+ if(measuring||!writer||stopping)return;
+ measuring=true;$('oxygen').className='value';$('oxygen').innerHTML='--<small>%</small>';
+ $('timestamp').textContent='Ölçüm devam ediyor';status('SpO₂ ölçülüyor...');refresh();
+ try{
+  await write(ON);
+  timer=setTimeout(async()=>{if(measuring){log('120 saniye zaman aşımı.');await stop('Sonuç alınamadı');}},120000);
+ }catch(e){measuring=false;status('Başlatma başarısız');log(e.message);refresh();}
+}
+async function stop(message='Ölçüm durduruldu'){
+ if(stopping||!measuring)return;
+ stopping=true;clearTimeout(timer);timer=null;refresh();
+ try{await write(OFF);status(message);}catch(e){status('Durdurma komutu başarısız');log(e.message);}
+ finally{measuring=false;stopping=false;refresh();}
+}
+function receive(event){
+ const view=event.target.value;
+ const bytes=new Uint8Array(view.buffer,view.byteOffset,view.byteLength);
+ log(`RX ${event.target.uuid}: ${hex(bytes)}`);
+ if(bytes.length<7||bytes[0]!==0xFD||bytes[1]!==0xDA||bytes[3]!==bytes.length)return;
+ if(bytes[4]!==0x01||bytes[5]!==0x0B)return;
+ const spo2=bytes[6];if(spo2<50||spo2>100){log('Geçersiz SpO₂ baytı: '+spo2);return;}
+ $('oxygen').innerHTML=`${spo2}<small>%</small>`;$('oxygen').className='value good';
+ $('timestamp').textContent='Ölçüm: '+new Date().toLocaleString('tr-TR');
+ log('SpO₂: '+spo2+'%');if(measuring)void stop('Ölçüm tamamlandı');
+}
+async function disconnect(){if(measuring)await stop();if(device&&device.gatt&&device.gatt.connected)device.gatt.disconnect();else disconnected();}
+$('connect').addEventListener('click',connect);
+$('start').addEventListener('click',start);
+$('stop').addEventListener('click',()=>stop());
+$('disconnect').addEventListener('click',disconnect);
+if(!navigator.bluetooth)log('Bluefy tarayıcısında açılmalı.');
+if(location.protocol!=='https:'&&location.hostname!=='localhost')log('HTTPS gerekli.');
+refresh();
+</script>
+</body>
+</html>
